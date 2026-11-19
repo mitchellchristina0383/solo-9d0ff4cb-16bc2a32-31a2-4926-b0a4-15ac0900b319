@@ -32,6 +32,18 @@ services:
       master:
         condition: service_healthy
 
+  loadtest:
+    build: .
+    command: uvicorn dnslab.loadtest_app:app --host 0.0.0.0 --port 8000
+    environment:
+      SLAVE_DNS_HOST: slave
+      SLAVE_DNS_PORT: "5353"
+    ports:
+      - "8002:8000"        # HTTP API + /docs (填参数、看报告)
+    depends_on:
+      slave:
+        condition: service_started
+
 volumes:
   master-data:
   slave-data:

@@ -32,6 +32,7 @@ docker compose up --build
 
 - 主节点 API / 文档： http://localhost:8000/docs
 - 从节点 API / 文档： http://localhost:8001/docs
+- 试跑服务 API / 文档： http://localhost:8002/docs
 - 从节点 DNS： `dig @127.0.0.1 -p 5353 host1.lab.test A` ／ `dig @127.0.0.1 -p 5353 lab.test SOA`
 
 从节点数据在命名卷 `slave-data` 中，`docker compose restart slave` 后仍用最后版本应答。
@@ -72,6 +73,39 @@ curl http://localhost:8001/status
 `KEEP_VERSIONS=100` 版，主要用于测试迟到旧版）；`{"url": ...}` 覆盖快照来源。
 设 `SYNC_INTERVAL=秒数` 可让从节点周期自动同步（默认 0，仅手动）。
 
+## 从节点试跑（load test）
+
+`loadtest` 服务（`dnslab/loadtest_app.py`，`/docs` 在 8002 端口）只向**同一套部署里的从节点**
+发 UDP `A` 查询，用来观察从节点在给定查询速率下能否跟上。目标是固定的
+`SLAVE_DNS_HOST`/`SLAVE_DNS_PORT`（Compose 里就是 `slave:5353`），请求参数无法改指向。
+
+在 http://localhost:8002/docs 打开 `POST /run`（“Try it out”），填写：
+
+| 字段 | 含义 | 限制 |
+|---|---|---|
+| `name` | 要查询的域名（只发 A 查询） | 必须是合法域名 |
+| `qps` | 每秒查询数（固定节拍，间隔 1/qps 秒） | ≤ 200 |
+| `duration_seconds` | 发包秒数 | ≤ 30 |
+| `max_in_flight` | 在途上限：已发出、还没按时应答/超时的查询数 | 1 – 6000 |
+
+一轮的规则：
+
+- **节拍固定**：第 i 条排在开始后 `i / qps` 秒。错过一个发包间隔（落后超过 1/qps 秒）
+  或在途已达上限，该节拍记为**未发**，跳过且不补发。
+- **500 ms 窗口**：每条查询只等到**计划时刻**（不是实际发出时刻）后 500 ms。迟到的应答
+  没有对应在途查询可记，既不算应答、也不会算给后面的查询（每轮每条查询的 DNS 报文 ID
+  各不相同）。
+- **一次一轮**：另一轮在跑时 `POST /run` 返回 409。
+
+`POST /run` 阻塞到本轮结束（最长约 30.5 秒）并返回报告，也可以 `GET /report` 取最近一轮。
+报告字段：`planned_queries`、按时应答总数 `on_time_answered` 及按 RCODE 的
+`rcode_counts`、`timeouts`、`not_sent`（附 `interval_missed` / `in_flight_full` / `send_error`
+细分），三者之和恒等于 `planned_queries`（`accounting_ok`）；`diagnostics` 另列出迟到重复、
+未知、畸形应答的数量，供排查用。`GET /status` 显示是否在跑。
+
+说明：试跑容器与应用容器共用同一个镜像，从节点没起好时仍可填参数并看到全部超时；
+UDP 无连接，真正的“目标不可达”只体现为超时。
+
 ## 自测
 
 ```bash
@@ -82,13 +116,22 @@ python tests/selftest.py    # 需要已安装 requirements.txt
 迟到旧版拒绝、断流与校验和损坏、并发发布+同步交错（序列号单调、最终内容逐条一致）、
 主节点失联、从节点重启、新从节点+主失联、`/docs` 可用性与主恢复后的同步。
 
+试跑服务单独自测（用可控延迟/丢包的假从节点，检查迟到应答、在途满载、RCODE 分类与
+“应答+超时+未发=计划数”）：
+
+```bash
+python tests/loadtest_selftest.py
+```
+
 ## 目录
 
 ```
-dnslab/dnsproto.py    最小 DNS 线格式编解码与应答逻辑（仅标准库）
-dnslab/master_app.py  主节点 FastAPI 应用
-dnslab/slave_app.py   从节点 FastAPI 应用 + UDP DNS 服务
-tests/selftest.py     端到端自测
+dnslab/dnsproto.py      最小 DNS 线格式编解码与应答逻辑（仅标准库）
+dnslab/master_app.py    主节点 FastAPI 应用
+dnslab/slave_app.py     从节点 FastAPI 应用 + UDP DNS 服务
+dnslab/loadtest_app.py  从节点 UDP 试跑服务（固定节拍 + 500 ms 窗口 + 报告）
+tests/selftest.py       主从端到端自测
+tests/loadtest_selftest.py  试跑服务自测（假从节点可注入延迟/丢包/RCODE）
 Dockerfile / docker-compose.yml
 ```
 
@@ -99,3 +142,5 @@ Dockerfile / docker-compose.yml
 - 快照为全量传输，适合 lab 规模；超大区域需增量机制。
 - 从节点应用快照时的 SQLite 写入在事件循环内完成，记录数极大时会短暂阻塞循环（lab 规模无感）。
 - 主节点 `/debug/snapshot/truncated`、`/debug/snapshot/corrupt` 仅用于故障注入测试，生产应移除。
+- 试跑服务按固定节拍由事件循环 `sleep` 驱动，宿主机或容器严重卡顿时部分节拍会记为未发
+  （这是设计上的如实记录，不是重试）；测量结果是端到端的，含本机 UDP 栈与容器网络延迟。
